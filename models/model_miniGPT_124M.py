@@ -9,6 +9,8 @@ import numpy as np
 
 import tiktoken
 
+baseline: bool = True
+
 @dataclass
 class miniGPTConfig:
     vocab_size: int = 32000
@@ -18,6 +20,7 @@ class miniGPTConfig:
     n_layers: int = 12
     drop_rate: float = 0.1
     qkv_bias: bool = False
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: miniGPTConfig):
@@ -44,15 +47,15 @@ class TransformerBlock(nn.Module):
 
         Here all are x because we’re doing self-attention.
 
-      🔹 What happens inside:
+    🔹 What happens inside:
         1. For each head, we create:
 
-                   Q=x*Wq, K=x*Wk, V=x*Wv
-           Shapes: [B, T, d_model] → [B, T, d_k] for each head.
+                Q=x*Wq, K=x*Wk, V=x*Wv
+        Shapes: [B, T, d_model] → [B, T, d_k] for each head.
 
         2. Compute attention scores:
 
-             score = Q*K.T/sqrt(d_k)
+            score = Q*K.T/sqrt(d_k)
 
         3. Apply causal mask:
 
@@ -62,11 +65,11 @@ class TransformerBlock(nn.Module):
 
         4. Softmax over scores to get weights:
 
-              weights = softmax(masked score)
+            weights = softmax(masked score)
 
         5. Weighted sum of values:
 
-              attn_out=weights⋅V
+            attn_out=weights⋅V
 
         6. Concatenate all heads and project back to d_model.
         """
@@ -106,7 +109,7 @@ class miniGPT(nn.Module):
             * Shape: [B, T, emb_dim]
         self.pos_emb(pos) → adds position vectors.
         Summation gives initial hidden states, which are -
-             input to Transformer block:
+            input to Transformer block:
 
                 x=h0=E[xt]+Pt  -> token_emb + pos_emb
 
@@ -116,12 +119,12 @@ class miniGPT(nn.Module):
             """
             Data goes through each Transformer block sequentially.
             Each block contains:
-                 1. Masked self-Attention
-                      Attn. = softmax(Q*K.T/sqrt(k_dim)+M)*V
-                      x=x+attn.(x)
-                 2. Feed-Forward Network
-                      Linear + GELU + Linear
-                      x=x+MLP(x)
+                1. Masked self-Attention
+                    Attn. = softmax(Q*K.T/sqrt(k_dim)+M)*V
+                    x=x+attn.(x)
+                2. Feed-Forward Network
+                    Linear + GELU + Linear
+                    x=x+MLP(x)
 
             """
         x = self.norm_f(x)
@@ -132,6 +135,7 @@ class miniGPT(nn.Module):
         Each position has a distribution over possible next tokens.
         """
         return logits   # logits = [batch, context_len, vocab_size]
+
 
 config = miniGPTConfig()
 model = miniGPT(config)
