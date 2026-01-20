@@ -35,15 +35,13 @@ from models.model_Anima_350M import Anima, AnimaConfig
 from models.model_miniGPT_124M import miniGPT, miniGPTConfig
 from torch.utils.checkpoint import checkpoint as activation_checkpoint # memory saving
 
-# ---------------------
-# Configuration set-up | Rule-13
-# ---------------------
-TrainConfig = {
-    "batch_size" : 4,
-    "learning_rate" : 3e-4,
-    "max_iters" : 10000,
 
-    "eval_interval" : 500,
+TrainConfig = {
+    "batch_size" : 2,
+    "learning_rate" : 3e-4,
+    "max_iters" : 50,
+
+    "eval_interval" : 10,
     # "log_interval" : 10,
 
     "grad_clip" : 1.0,
@@ -54,69 +52,85 @@ TrainConfig = {
     "out_dir" : './checkpoints',
     "activation_checkpointing": True,
 
-    "device" : 'cuda',
+    "device" : "cuda" if torch.cuda.is_available() else "cpu",
     "ddp": False,
+    "amp": True,
 
-    "max_steps": 10000,
+    "world_size": 1,
+    "rank": 0,
+    "seed": 42,
+
+    "max_steps": 50,
     "accumulate_grad": 4,
 
     "dataset_name": "the-verdict"
 }
+
+def validation_config(Config):
+    assert Config["batch_size"] > 0
+    assert Config["learning_rate"] > 0
+    assert Config["max_steps"] > 0
+    if Config["device"] == "cpu" and Config["amp"]:
+        raise ValueError("AMP requested but device is CPU.")
+    # Divisibility: ensure batch is divisible by DP world size if using DDP
+    if Config["world_size"] > 1:
+        assert Config["batch_size"] % Config["world_size"] == 0, \
+            "batch_size must be divisible by world_size"
+
+validation_config(TrainConfig)
+
+
+random.seed(TrainConfig["seed"])
+torch.manual_seed(TrainConfig["seed"])
+torch.cuda.manual_seed_all(TrainConfig["seed"])
 
 # ----------- CUDA environment set-up ----------- #
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # model.to(device)
 
 # ---------------- Initialize distributed process group ---------------- #
-def setup_distributed():
-    # These are automatically set by torchrun
-    local_rank = int(os.environ["LOCAL_RANK"])
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
+def init_distributed():
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+        TrainConfig["rank"] = int(os.environ["RANK"])
+        TrainConfig["world_size"] = int(os.environ["WORLD_SIZE"])
+        torch.distributed.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(TrainConfig["rank"] % torch.cuda.device_count())
+        TrainConfig["device"] = torch.device("cuda", TrainConfig["rank"] % torch.cuda.device_count())
+    else:
+        TrainConfig["world_size"] = 1
+        TrainConfig["rank"] = 0
+        TrainConfig["device"] = torch.device(TrainConfig["device"])
 
-    dist.init_process_group(
-        backend="nccl",       # GPU backend (use "gloo" for CPU-only)
-        rank=rank,
-        world_size=world_size
-    )
-    torch.cuda.set_device(local_rank)
+init_distributed()
+validation_config(TrainConfig)
 
-    return local_rank, rank, world_size
+LOCAL_RANK = TrainConfig["rank"]
 
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
 
-# ---------------- Helper: Check if this is main process ----------------#
+# ---------------- Helper: Check if this is main process ---------------- #
 ModelConfig = miniGPTConfig()
 model = miniGPT(ModelConfig)
 
+total_params = sum(p.numel() for p in model.parameters())
+print("Model loaded successfully...")
+print(f"Total number of parameters: {total_params:,}")
+
 if TrainConfig["ddp"]:
-    local_rank, rank, world_size = setup_distributed()
-    model.to(local_rank)
-    model = DDP(model, device_ids=[local_rank])
+    model.to(TrainConfig["rank"])
+    model = DDP(model, device_ids=[TrainConfig["rank"]])
 else:
-    model = model.to(device)
+    model = model.to(TrainConfig["device"])
 
-# Optimizer
-optimizer = torch.optim.AdamW(model.parameters(),
-                              lr=TrainConfig["learning_rate"],
-                              betas=TrainConfig["betas"],
-                              weight_decay=TrainConfig["weight_decay"]
-                              )
-
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2000)    # optimizer=optimizer, learning_rate=3e-4, learning_rate_iter= , final_learning_rate= ,
-# --------------------------------
-# Optional: Mixed precision scaler
-# --------------------------------
-scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
 
 # -----------
 # DataLoading
 # -----------
-# x = torch.randint(0, ModelConfig.vocab_size, (TrainConfig["batch_size"], ModelConfig.seq_len))
-# y = torch.randint(0, ModelConfig.vocab_size, (TrainConfig["batch_size"], ModelConfig.seq_len))
-# xb = x.to(device)
-# yb = y.to(device)
+x = torch.randint(0, ModelConfig.vocab_size, (TrainConfig["batch_size"], ModelConfig.seq_len))
+y = torch.randint(0, ModelConfig.vocab_size, (TrainConfig["batch_size"], ModelConfig.seq_len))
+xb = x.to(device)
+yb = y.to(device)
 
 # splits = load_from_disk("D:/datasets/tinystories_512_splits")
 
@@ -124,22 +138,22 @@ scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
 # val_ds = splits["validation"]
 # test_ds = splits["test"]
 
-with open("/content/the-verdict.txt", "r", encoding="utf-8") as f:
-    text = f.read()
+# with open("/content/the-verdict.txt", "r", encoding="utf-8") as f:
+#     text = f.read()
 
-enc = tiktoken.get_encoding("gpt2")
-tokens = torch.tensor(enc.encode(text), dtype=torch.long)
+# enc = tiktoken.get_encoding("gpt2")
+# tokens = torch.tensor(enc.encode(text), dtype=torch.long)
 
-n = len(tokens)
-train_ids = tokens[: int(0.9 * n)]
-val_ids = tokens[int(0.9 * n):]
+# n = len(tokens)
+# train_ids = tokens[: int(0.9 * n)]
+# val_ids = tokens[int(0.9 * n):]
 
-def get_batch(split):
-    data = train_ids if split == "train" else val_ids
-    idx = torch.randint(len(data) - ModelConfig.seq_len, (TrainConfig["batch_size"],))
-    x = torch.stack([data[i : i + ModelConfig.seq_len] for i in idx])
-    y = torch.stack([data[i + 1 : i + ModelConfig.seq_len + 1] for i in idx])
-    return x.to(device), y.to(device)
+# def get_batch(split):
+#     data = train_ids if split == "train" else val_ids
+#     idx = torch.randint(len(data) - ModelConfig.seq_len, (TrainConfig["batch_size"],))
+#     x = torch.stack([data[i : i + ModelConfig.seq_len] for i in idx])
+#     y = torch.stack([data[i + 1 : i + ModelConfig.seq_len + 1] for i in idx])
+#     return x.to(device), y.to(device)
 
 # ----------
 # VALIDATION
@@ -152,7 +166,7 @@ def evaluate(model, eval_iters=100):
     total = 0
 
     for _ in range(eval_iters):
-        xb, yb = get_batch("val")
+        # xb, yb = get_batch("val")
         logits = model(xb)
         loss = F.cross_entropy(
             logits.view(-1, logits.size(-1)),
@@ -169,7 +183,17 @@ def evaluate(model, eval_iters=100):
     return avg_loss, correct / total, math.exp(avg_loss)
 
 
-metrics = defaultdict(list)
+# metrics = defaultdict(list)
+metrics = {
+    "step": [],
+    "train_loss": [],
+    "val_loss": [],
+    "val_accuracy": [],
+    "val_perplexity": [],
+    "learning_rate": [],
+    "tokens_per_sec": [],
+    "elapsed_time": []
+}
 
 # ----- 
 # WANDB
@@ -180,16 +204,36 @@ if is_main_process():
         name="miniGPT-124M-verdict",
         config=TrainConfig
     )
+
+# ---------
+# Optimizer
+# ---------
+optimizer = torch.optim.AdamW(model.parameters(),
+                              lr=TrainConfig["learning_rate"],
+                              betas=TrainConfig["betas"],
+                              weight_decay=TrainConfig["weight_decay"]
+                              )
+
+def lr_lambda(step):
+    warmup_steps = 1000
+    if step < warmup_steps:
+        return float(step) / max(1, warmup_steps)
+    return max(0.0, 0.5 * (1.0 + math.cos((step - warmup_steps) / (100000 - warmup_steps) * math.pi)))
+
+scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+# --------------------------------
+# Optional: Mixed precision scaler
+# --------------------------------
+scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
+
 # --------------
 # Resume Training
 # --------------
-# Training metrics png/pdf.....
+
 OUT_DIR = "./training_outputs"
 os.makedirs(OUT_DIR, exist_ok=True)
-# save_dir = os.path.join(OUT_DIR if "OUT_DIR" in globals() else "/content")
-# os.makedirs(save_dir, exist_ok=True)
-# resume_path = os.path.join(OUT_DIR, "ckpt.pt")
-# resume_path = "ckpt.pt"
+resume_path = "ckpt.pt"
 start_step = 0
 
 if os.path.exists(TrainConfig["resume_path"]):
@@ -201,8 +245,8 @@ if os.path.exists(TrainConfig["resume_path"]):
 
     scheduler.load_state_dict(checkpoint["scheduler"])
 
-    if scaler and "scaler" in checkpoint:
-        scaler.load_state_dict(checkpoint["scaler"])
+    # if scaler and "scaler" in checkpoint:
+    #     scaler.load_state_dict(checkpoint["scaler"])
 
     start_step = checkpoint["step"] + 1  # continue from next step
 
@@ -237,188 +281,182 @@ accum_steps = TrainConfig["accumulate_grad"]
 
 # optimizer.zero_grad(set_to_none=True)
 
-try:
-    while step < TrainConfig["max_steps"]:
-        iter_start = time.time()
-        # optimizer.zero_grad()
+while step < TrainConfig["max_steps"]:
+    iter_start = time.time()
+    # optimizer.zero_grad()
 
-        for _ in range(accum_steps):
-            xb, yb = get_batch("train")
-            xb, yb = xb.to(device), yb.to(device)
+    for _ in range(accum_steps):
+        # xb, yb = get_batch("train")
+        # xb, yb = xb.to(device), yb.to(device)
 
-            if scaler:
-                with torch.cuda.amp.autocast():
-                    if TrainConfig.get("activation_checkpointing", False):
-                        logits = activation_checkpoint(model, xb)
-                    else:
-                        logits = model(xb)
-                    loss = F.cross_entropy(logits.reshape(-1, ModelConfig['vocab_size']), yb.reshape(-1)) / accum_steps
-                scaler.scale(loss).backward()
-            else:
-                if TrainConfig.get("activation_checkpointing", False):
-                    logits = activation_checkpoint(model, xb)
-                else:
-                    logits = model(xb)
-                loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), yb.view(-1)) / accum_steps
-                loss.backward()
-        
         if scaler:
-            scaler.unscale_(optimizer)
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), TrainConfig["grad_clip"])
-
-        # ---- Back Tracking ---->
-        if scaler:
-            scaler.step(optimizer)
-            scaler.update()
+            with torch.cuda.amp.autocast():
+                logits = model(xb)
+                loss = F.cross_entropy(logits.reshape(-1, ModelConfig['vocab_size']), yb.reshape(-1)) / accum_steps
+            scaler.scale(loss).backward()
         else:
-            optimizer.step()
+            logits = model(xb)
+            loss = F.cross_entropy(logits.view(-1, logits.shape[-1]), yb.view(-1)) / accum_steps
+            loss.backward()
+    
+    if scaler:
+        scaler.unscale_(optimizer)
 
-        optimizer.zero_grad(set_to_none=True)
-        # 3. Learning rate scheduler
-        scheduler.step()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), TrainConfig["grad_clip"])
 
-        iter_time = time.time() - iter_start
-        tokens_per_sec = (tokens_per_step * accum_steps) / iter_time
+    # ---- Back Tracking ---->
+    if scaler:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
 
-        # <|---------Save checkpoint every N-step---------|>
-        if step % TrainConfig["eval_interval"] == 0:  # step ==  TrainConfig["max_steps"] - 1 or  #step == max_step-1
-            val_loss, val_acc, val_ppl = evaluate(model)
-            elapsed = time.time() - start_time
-            lr = scheduler.get_last_lr()[0]
+    optimizer.zero_grad(set_to_none=True)
+    # 3. Learning rate scheduler
+    scheduler.step()
 
-            metrics["step"].append(step)
-            metrics["train_loss"].append(loss.item() * accum_steps)
-            metrics["val_loss"].append(val_loss)
-            metrics["val_accuracy"].append(val_acc)
-            metrics["val_perplexity"].append(val_ppl)
-            metrics["learning_rate"].append(lr)
-            metrics["tokens_per_sec"].append(tokens_per_sec)
-            metrics["elapsed_time"].append(elapsed)
+    iter_time = time.time() - iter_start
+    tokens_per_sec = (tokens_per_step * accum_steps) / iter_time
 
-            if is_main_process():
-                print(
-                    f"Step {step} | "
-                    f"Train {loss.item()*accum_steps:.4f} | "
-                    f"Val {val_loss:.4f} | "
-                    f"PPL {val_ppl:.2f} | "
-                    f"Tok/s {tokens_per_sec:.0f}"
-                )
+    # # <|---------Save checkpoint every N-step---------|>
+    if step % TrainConfig["eval_interval"] == 0 or step == TrainConfig["max_steps"] - 1:
+        val_loss, val_acc, val_ppl = evaluate(model)
+        elapsed = time.time() - start_time
+        lr = scheduler.get_last_lr()[0]
 
-                wandb.log({
-                    "step": step,
-                    "train_loss": loss.item() * accum_steps,
-                    "val_loss": val_loss,
-                    "val_accuracy": val_acc,
-                    "val_perplexity": val_ppl,
-                    "learning_rate": lr,
-                    "tokens_per_sec": tokens_per_sec,
-                    "elapsed_time": elapsed
-                })
+        metrics["step"].append(step)
+        metrics["train_loss"].append(loss.item() * accum_steps)
+        metrics["val_loss"].append(val_loss)
+        metrics["val_accuracy"].append(val_acc)
+        metrics["val_perplexity"].append(val_ppl)
+        metrics["learning_rate"].append(lr)
+        metrics["tokens_per_sec"].append(tokens_per_sec)
+        metrics["elapsed_time"].append(elapsed)
 
-                checkpoint = {
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "rng_state": torch.get_rng_state(),
-                    "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                    "numpy_rng_state": np.random.get_state(),
-                    "python_rng_state": random.getstate()
-                }
+        if is_main_process():
+            print(
+                f"Step {step} | "
+                f"Train {loss.item()*accum_steps:.4f} | "
+                f"Val {val_loss:.4f} | "
+                f"PPL {val_ppl:.2f} | "
+                f"Tok/s {tokens_per_sec:.0f}"
+            )
 
-                torch.save(checkpoint, TrainConfig["resume_path"])
-                print(f"Checkpoint saved at step: {step}")
-            
-        step +=1
-
-    total_time = time.time() - start_time
-
-    def plot_training_metrics(metrics, out_dir=OUT_DIR):
-        steps = metrics["step"]
-
-        plt.figure(figsize=(18, 12))
-
-        # ---------------- Loss ----------------
-        plt.subplot(2, 3, 1)
-        plt.plot(steps, metrics["train_loss"], label="Train Loss")
-        plt.plot(steps, metrics["val_loss"], label="Val Loss")
-        plt.xlabel("Steps")
-        plt.ylabel("Loss")
-        plt.title("Training & Validation Loss")
-        plt.legend()
-
-        # ---------------- Accuracy ----------------
-        plt.subplot(2, 3, 2)
-        plt.plot(steps, metrics["val_accuracy"])
-        plt.xlabel("Steps")
-        plt.ylabel("Accuracy")
-        plt.title("Validation Accuracy")
-
-        # ---------------- Perplexity ----------------
-        plt.subplot(2, 3, 3)
-        plt.plot(steps, metrics["val_perplexity"])
-        plt.xlabel("Steps")
-        plt.ylabel("Perplexity")
-        plt.title("Validation Perplexity")
-
-        # ---------------- Learning Rate ----------------
-        plt.subplot(2, 3, 4)
-        plt.plot(steps, metrics["learning_rate"])
-        plt.xlabel("Steps")
-        plt.ylabel("LR")
-        plt.title("Learning Rate Schedule")
-
-        # ---------------- Throughput ----------------
-        plt.subplot(2, 3, 5)
-        plt.plot(steps, metrics["tokens_per_sec"])
-        plt.xlabel("Steps")
-        plt.ylabel("Tokens/sec")
-        plt.title("Training Throughput")
-
-        # ---------------- Time ----------------
-        plt.subplot(2, 3, 6)
-        plt.plot(steps, metrics["elapsed_time"])
-        plt.xlabel("Steps")
-        plt.ylabel("Seconds")
-        plt.title("Elapsed Training Time")
-
-        plt.tight_layout()
-        
-        # ---- Save plots ----
-        pdf_path = os.path.join(out_dir, "training_metrics.pdf")
-        png_path = os.path.join(out_dir, "training_metrics.png")
-
-        plt.savefig(pdf_path)
-        plt.savefig(png_path, dpi=300)
-        plt.close()
-
-        print(f"Saved plots to:\n{pdf_path}\n{png_path}")
-
-        # ---- Save raw metrics ----
-        metrics_path = os.path.join(out_dir, "metrics.json")
-        with open(metrics_path, "w") as f:
-            json.dump(metrics, f, indent=2)
-
-        print(f"Saved raw metrics to:\n{metrics_path}")
-        # plt.show()
-
-        # ---- Log to W&B ----
-        if is_main_process() and wandb.run is not None:
             wandb.log({
-                "training_plots": wandb.Image(png_path)
+                "step": step,
+                "train_loss": loss.item() * accum_steps,
+                "val_loss": val_loss,
+                "val_accuracy": val_acc,
+                "val_perplexity": val_ppl,
+                "learning_rate": lr,
+                "tokens_per_sec": tokens_per_sec,
+                "elapsed_time": elapsed
             })
 
-    if is_main_process():
-        plot_training_metrics(metrics)
-        print(f"Total training time: {total_time/3600:.2f} hours")
-        wandb.log({"total_training_time": total_time})
-        wandb.finish()
+        checkpoint = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "scheduler": scheduler.state_dict(),
+            # "scaler": scaler.state_dict() if scaler is not None else None,
+            "rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy_rng_state": np.random.get_state(),
+            "python_rng_state": random.getstate()
+        }
 
-    if TrainConfig["ddp"]:
-        dist.destroy_process_group()
+        torch.save(checkpoint, TrainConfig["resume_path"])
+        print(f"Checkpoint saved at step: {step}")
+        
+    
+    # Logging
+    if step % 10 == 0:
+        print(f"Step :{step}, loss :{loss.item():.4f}")
 
-except KeyboardInterrupt:
-    print("Checkpoints saved at last step...")   # Destroy all the ddp configuration, so to no error for the cumulative training or fine-tuning...
+    step +=1
 
+total_time = time.time() - start_time
+
+def plot_training_metrics(metrics, out_dir=OUT_DIR):
+    steps = metrics["step"]
+
+    plt.figure(figsize=(18, 12))
+
+    # ---------------- Loss ----------------
+    plt.subplot(2, 3, 1)
+    plt.plot(steps, metrics["train_loss"], label="Train Loss")
+    plt.plot(steps, metrics["val_loss"], label="Val Loss")
+    plt.xlabel("Steps")
+    plt.ylabel("Loss")
+    plt.title("Training & Validation Loss")
+    plt.legend()
+
+    # ---------------- Accuracy ----------------
+    plt.subplot(2, 3, 2)
+    plt.plot(steps, metrics["val_accuracy"])
+    plt.xlabel("Steps")
+    plt.ylabel("Accuracy")
+    plt.title("Validation Accuracy")
+
+    # ---------------- Perplexity ----------------
+    plt.subplot(2, 3, 3)
+    plt.plot(steps, metrics["val_perplexity"])
+    plt.xlabel("Steps")
+    plt.ylabel("Perplexity")
+    plt.title("Validation Perplexity")
+
+    # ---------------- Learning Rate ----------------
+    plt.subplot(2, 3, 4)
+    plt.plot(steps, metrics["learning_rate"])
+    plt.xlabel("Steps")
+    plt.ylabel("LR")
+    plt.title("Learning Rate Schedule")
+
+    # ---------------- Throughput ----------------
+    plt.subplot(2, 3, 5)
+    plt.plot(steps, metrics["tokens_per_sec"])
+    plt.xlabel("Steps")
+    plt.ylabel("Tokens/sec")
+    plt.title("Training Throughput")
+
+    # ---------------- Time ----------------
+    plt.subplot(2, 3, 6)
+    plt.plot(steps, metrics["elapsed_time"])
+    plt.xlabel("Steps")
+    plt.ylabel("Seconds")
+    plt.title("Elapsed Training Time")
+
+    plt.tight_layout()
+    
+    # ---- Save plots ----
+    pdf_path = os.path.join(out_dir, "training_metrics.pdf")
+    png_path = os.path.join(out_dir, "training_metrics.png")
+
+    plt.savefig(pdf_path)
+    plt.savefig(png_path, dpi=300)
+    plt.close()
+
+    print(f"Saved plots to:\n{pdf_path}\n{png_path}")
+
+    # ---- Save raw metrics ----
+    metrics_path = os.path.join(out_dir, "metrics.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    print(f"Saved raw metrics to:\n{metrics_path}")
+    # plt.show()
+
+    # ---- Log to W&B ----
+    if is_main_process() and wandb.run is not None:
+        wandb.log({
+            "training_plots": wandb.Image(png_path)
+        })
+
+if is_main_process():
+    plot_training_metrics(metrics)
+    # print(f"Total training time: {total_time/3600:.2f} hours")
+    # wandb.log({"total_training_time": total_time})
+    # wandb.finish()
+
+if TrainConfig["ddp"]:
+    dist.destroy_process_group()

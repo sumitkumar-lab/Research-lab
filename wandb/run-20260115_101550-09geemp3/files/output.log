@@ -1,0 +1,6 @@
+Resuming from checkpoint: ckpt.pt
+Saved plots to:
+./training_outputs\training_metrics.pdf
+./training_outputs\training_metrics.png
+Saved raw metrics to:
+./training_outputs\metrics.json

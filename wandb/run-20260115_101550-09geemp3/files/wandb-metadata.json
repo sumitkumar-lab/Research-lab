@@ -1,0 +1,28 @@
+{
+  "os":  "Windows-10-10.0.19045-SP0",
+  "python":  "CPython 3.12.1",
+  "startedAt":  "2026-01-15T04:45:50.682657Z",
+  "program":  "D:\\tiny-llm-model\\train.py",
+  "codePath":  "train.py",
+  "codePathLocal":  "train.py",
+  "git":  {
+    "remote":  "https://github.com/sumitrwk90/tiny-llm-model.git",
+    "commit":  "06329fb92c7a89b94ffe8c108df987059e1d6cd4"
+  },
+  "email":  "sumitrwk@gmail.com",
+  "root":  "D:\\tiny-llm-model",
+  "host":  "venom",
+  "executable":  "D:\\tiny-llm-model\\venv\\Scripts\\python.exe",
+  "cpu_count":  2,
+  "cpu_count_logical":  4,
+  "disk":  {
+    "/":  {
+      "total":  "107725451264",
+      "used":  "43874373632"
+    }
+  },
+  "memory":  {
+    "total":  "17028448256"
+  },
+  "writerId":  "v4bdryt1cf5ghcply8pnhhqc6t4aotuu"
+}

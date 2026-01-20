@@ -13,10 +13,10 @@ baseline: bool = True
 
 @dataclass
 class miniGPTConfig:
-    vocab_size: int = 32000
-    seq_len: int = 1024
-    emb_dim: int = 768
-    n_heads: int = 12
+    vocab_size: int = 156
+    seq_len: int = 256
+    emb_dim: int = 128
+    n_heads: int = 4
     n_layers: int = 12
     drop_rate: float = 0.1
     qkv_bias: bool = False
@@ -137,10 +137,10 @@ class miniGPT(nn.Module):
         return logits   # logits = [batch, context_len, vocab_size]
 
 
-config = miniGPTConfig()
-model = miniGPT(config)
+# config = miniGPTConfig()
+# model = miniGPT(config)
 
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total number of parameters: {total_params:,}")
-print("Parameter count mostly depends on vocab_size, n_layers, seq_len, and emb_dims")
+# total_params = sum(p.numel() for p in model.parameters())
+# print(f"Total number of parameters: {total_params:,}")
+# print("Parameter count mostly depends on vocab_size, n_layers, seq_len, and emb_dims")
 

@@ -1,0 +1,1 @@
+{"elapsed_time":72.60639691352844,"total_training_time":72.829416513443,"learning_rate":0.00029953760005996895,"step":49,"val_perplexity":1.5272478247930001,"_wandb":{"runtime":79},"tokens_per_sec":2242.4684445217176,"_runtime":79,"val_accuracy":1,"val_loss":0.4234673082828522,"train_loss":0.4492301940917969,"_timestamp":1.768382746958628e+09,"_step":1}

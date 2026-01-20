@@ -1,0 +1,12 @@
+Step :0, loss :1.3063
+Step :10, loss :0.8470
+Step :20, loss :0.5541
+Step :30, loss :0.3414
+Step :40, loss :0.1934
+Step 49 | Train 0.4463 | Val 0.4203 | PPL 1.52 | Tok/s 2248
+Checkpoint saved at step: 49
+Saved plots to:
+./training_outputs\training_metrics.pdf
+./training_outputs\training_metrics.png
+Saved raw metrics to:
+./training_outputs\metrics.json

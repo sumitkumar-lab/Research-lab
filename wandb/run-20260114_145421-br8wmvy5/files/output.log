@@ -1,0 +1,8 @@
+Step :0, loss :1.3037
+Step :10, loss :0.8517
+Step :20, loss :0.5599
+Step :30, loss :0.3441
+Step :40, loss :0.1943
+Step 49 | Train 0.4492 | Val 0.4235 | PPL 1.53 | Tok/s 2242
+Checkpoint saved at step: 49
+Total training time: 0.02 hours
