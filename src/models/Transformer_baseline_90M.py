@@ -1,162 +1,183 @@
+import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from transformers import PreTrainedModel, PretrainedConfig
-from tqdm import tqdm
+from torch.nn import functional as F
+from configs.model.gpt_nano import GPTConfig
 
-import re
-import random
-import os
-import time
-import numpy as np
-
-
-class BaseConfig(PretrainedConfig):
-    model_type = "transformer"
-
-    def __init__(
-        self,
-        vocab_size=50257,
-        seq_len=128,
-        emb_dim=516,
-        n_heads=6,
-        n_layers=12,
-        # drop_rate=0.1,
-        qkv_bias=False,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.vocab_size = vocab_size
-        self.seq_len = seq_len
-        self.emb_dim = emb_dim
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        # self.drop_rate = drop_rate
-        self.qkv_bias = qkv_bias
-
-
-# Create Multi-Head Attention class...
-class MultiheadAttention(nn.Module):
-    def __init__(self, emb_dim, n_heads):
+class LayerNorm(nn.Module):
+    """
+    Research Note: We implement LayerNorm manually to support the 'bias' toggle.
+    PyTorch's native LayerNorm always has bias by default in older versions, 
+    or is less transparent about the affine transform.
+    """
+    def __init__(self, ndim, bias):
         super().__init__()
-        assert (emb_dim % n_heads == 0), \
-            "emb_dim must be divisible by n_heads"
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-        self.emb_dim = emb_dim
-        self.n_heads = n_heads
-        self.head_dim = emb_dim // n_heads # Reduce the projection dim to match desired output dim
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-        # Trainable weights
-        self.W_query = nn.Linear(emb_dim, emb_dim)
-        self.W_key = nn.Linear(emb_dim, emb_dim)
-        self.W_value = nn.Linear(emb_dim, emb_dim)
-
-        self.out_proj = nn.Linear(emb_dim, emb_dim)  # Linear layer to combine head outputs
-
-    def forward(self, x):
-        b, t, d = x.shape
-
-        keys = self.W_key(x) # Shape: (b, num_tokens, d_out)
-        queries = self.W_query(x)
-        values = self.W_value(x)
-
-        # We implicitly split the matrix by adding a `num_heads` dimension
-        # Unroll last dim: (b, num_tokens, d_out) -> (b, num_tokens, num_heads, head_dim)
-        keys = keys.view(b, t, self.n_heads, self.head_dim)
-        values = values.view(b, t, self.n_heads, self.head_dim)
-        queries = queries.view(b, t, self.n_heads, self.head_dim)
-
-        # Reshape batch -> Transpose: (b, num_tokens, num_heads, head_dim) -> (b, num_heads, num_tokens, head_dim)
-        k = keys.transpose(1, 2)
-        q = queries.transpose(1, 2)
-        v = values.transpose(1, 2)
-
-        # Compute scaled dot-product attention (aka self-attention) with a causal mask
-        attn_scores = q @ k.transpose(2, 3)  # Dot product for each head
-
-        # Original mask truncated to the number of tokens and converted to boolean
-        mask = torch.triu(torch.ones(t, k.size(2), device=x.device), diagonal=1)
-        attn_scores = attn_scores.masked_fill(mask.bool(), float('-inf'))
-
-        attn_weights = torch.softmax(attn_scores / k.shape[-1]**0.5, dim=-1)
-
-        # Shape: (b, num_tokens, num_heads, head_dim)
-        context_vec = (attn_weights @ v).transpose(1, 2)
-
-        # Combine heads, where self.d_out = self.num_heads * self.head_dim
-        context_vec = context_vec.contiguous().view(b, t, self.emb_dim)
-        context_vec = self.out_proj(context_vec) # optional projection
-
-        return context_vec
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, emb_dim, n_heads):
+class CausalSelfAttention(nn.Module):
+    def __init__(self, config: GPTConfig):
         super().__init__()
-        self.attn = MultiheadAttention(emb_dim, n_heads)
-        self.norm_1 = nn.LayerNorm(emb_dim)
-        self.ff = nn.Sequential(
-            nn.Linear(emb_dim, 4*emb_dim),
-            nn.GELU(),
-            nn.Linear(4*emb_dim, emb_dim)
-        )
-        self.norm_2 = nn.LayerNorm(emb_dim)
-
-
-    def forward(self, x):
-        """
-        x = token_emb + pos_emb
-        x = [b, t, emb_dim],  t = seq_len or context_len
-        """
-        attn_out = self.attn(x)
-
-        x = x + attn_out   # Residual connection
-        x = self.norm_1(x)
-        x = x + self.ff(x)
-        """
-        x*W1+b1 -> GeLU -> x*W2+b2
-        """
-        x = self.norm_2(x)
-        return x   # x -> [b, t, emb_dim] or [batch, context_len, emb_dim]
-
-
-class Dillusion(PreTrainedModel):
-    config_class = BaseConfig
-
-    def __init__(self, cfg: BaseConfig):
-        super().__init__(cfg)
-        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.emb_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(1, cfg.seq_len, cfg.emb_dim))
-
-        self.blocks = nn.ModuleList([
-            TransformerBlock(cfg.emb_dim, cfg.n_heads) for _ in range(cfg.n_layers)
-            ])
-
-        self.norm_f = nn.LayerNorm(cfg.emb_dim)
-        self.head = nn.Linear(cfg.emb_dim, cfg.vocab_size, bias=False)    # logits=h*W.T
-
-
-    def forward(self, idx):  # input -> idx = [batch_size, sequence_length]
-        b, t = idx.shape       # b -> batch, t -> seq_len
-        # pos = torch.arange(0, t, device=idx.device).unsqueeze(0)
-        x = self.token_emb(idx) + self.pos_emb[:, :t]
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.norm_f(x)
-        logits = self.head(x)   # y_pred or logits = softmax(x*W.T)
+        assert config.n_embd % config.n_head == 0
+        # Key, Query, Value projections
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # Output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
         
-        return logits   # logits = [batch, context_len, vocab_size]
-    
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        
+        # Flash Attention support check (PyTorch 2.0+)
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            # Causal mask for slow attention (only if flash is unavailable)
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                        .view(1, 1, config.block_size, config.block_size))
 
-# vocab_size = enc.n_vocab
-cfg = BaseConfig()
-model = Dillusion(cfg)
+    def forward(self, x):
+        B, T, C = x.size() # batch, time, channels
 
-x = torch.randint(0, cfg.vocab_size, (32, cfg.seq_len))
-logits = model(x)
-# logits.shape
+        # Calculate query, key, values
+        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        
+        # Transpose for multi-head attention: (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-total_params = sum(p.numel() for p in model.parameters())
-print(f"Total number of parameters: {total_params:,}")
+        # Causal Attention
+        if self.flash:
+            # Efficient implementation
+            y = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True
+            )
+        else:
+            # Manual implementation (Good for visualizing attention maps in research)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_dropout(att)
+            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+            
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+class MLP(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu    = nn.GELU() # Research Point: Easy to swap for SwiGLU here
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
+class Block(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        # Pre-Norm Architecture (Standard for stability)
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, config: GPTConfig):
+        super().__init__()
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+        
+        # Output Head
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Parameter Weight Tying (Standard GPT practice)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # Init weights
+        self.apply(self._init_weights)
+        
+        # Research Point: Special scaled init for residual projections to stabilize deep networks
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
+        device = idx.device
+        b, t = idx.size()
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+
+        # Forward pass
+        tok_emb = self.transformer.wte(idx) 
+        pos_emb = self.transformer.wpe(pos) 
+        x = self.transformer.drop(tok_emb + pos_emb)
+        
+        for block in self.transformer.h:
+            x = block(x)
+            
+        x = self.transformer.ln_f(x)
+
+        if targets is not None:
+            # If we are training, we calculate loss here
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # Inference optimization: only forward the last token
+            logits = self.lm_head(x[:, [-1], :]) 
+            loss = None
+
+        return logits, loss
+
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
+        """
+        Research Note: This separates parameters into those that should decay 
+        (weights) and those that shouldn't (biases, layer norm).
+        """
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        
+        # Fused Adam check for NVIDIA GPUs
+        use_fused = (device_type == 'cuda') and ('fused' in torch.optim.AdamW.__init__.__code__.co_varnames)
+        print(f"using fused AdamW: {use_fused}")
+        extra_args = dict(fused=True) if use_fused else dict()
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        
+        return optimizer

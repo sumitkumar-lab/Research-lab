@@ -1,0 +1,11 @@
+_target_: src.models.transformer.GPT
+config:
+  _target_: src.models.config.GPTConfig
+  block_size: 256        # Reduced for rapid testing
+  vocab_size: 65         # Example: Shakespeare char-level
+  n_layer: 4             # Shallow for quick feedback loops
+  n_head: 4
+  n_embd: 64             # "Nano" size
+  dropout: 0.1
+  bias: false            # Research: Test Llama-style bias-free training
+  use_rms_norm: false    # Toggle this to test different norms
